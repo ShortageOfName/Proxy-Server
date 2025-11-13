@@ -1,4 +1,4 @@
-# main.py - Dynamic Rotating Proxy on Render (BYPASSES 403 BLOCKING)
+# main.py - FINAL WORKING ROTATING PROXY (NO 404, NO 403)
 from fastapi import FastAPI, Request, HTTPException, Depends, status
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,12 +15,12 @@ import os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Free Rotating Proxy (No API Blocking)")
+app = FastAPI(title="Free Rotating Proxy")
 
 # === AUTH ===
 security = HTTPBasic()
-USERNAME = os.getenv("PROXY_USER", "user")
-PASSWORD = os.getenv("PROXY_PASS", "pass")
+USERNAME = os.getenv("PROXY_USER", "rood")
+PASSWORD = os.getenv("PROXY_PASS", "rood123")
 
 def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials.username != USERNAME or credentials.password != PASSWORD:
@@ -35,21 +35,19 @@ POOL_LOCK = asyncio.Lock()
 LAST_FETCH = datetime.min
 FETCH_INTERVAL = timedelta(minutes=25)
 
-# === FETCH PROXIES FROM GITHUB (NO API, NO 403) ===
+# === FETCH PROXIES FROM GITHUB ===
 async def fetch_proxies():
     global PROXY_POOL, LAST_FETCH
     if datetime.now() - LAST_FETCH < FETCH_INTERVAL and PROXY_POOL:
         return
 
-    # Public proxy lists on GitHub (updated hourly)
     sources = [
         "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-        "https://raw.githubusercontent.com/mertguvencli/proxy-list/main/proxies/http.txt",
     ]
 
-    candidates: list[str] = []
+    candidates = []
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
         for url in sources:
             try:
@@ -58,19 +56,13 @@ async def fetch_proxies():
                         text = await resp.text()
                         lines = [line.strip() for line in text.split('\n') if ':' in line and '.' in line.split(':')[0]]
                         candidates.extend(lines)
-                        logger.info(f"Fetched {len(lines)} from {url.split('/')[-1]}")
             except Exception as e:
-                logger.warning(f"Failed to fetch {url}: {e}")
+                logger.warning(f"Failed: {url} -> {e}")
 
     if not candidates:
-        logger.error("No proxy candidates fetched from any source")
         return
 
-    # Remove duplicates
     candidates = list(dict.fromkeys(candidates))
-    logger.info(f"Total unique candidates: {len(candidates)}")
-
-    # Validate up to 40 in parallel
     sample = random.sample(candidates, min(40, len(candidates)))
     tasks = [test_proxy(session, f"http://{ip_port}") for ip_port in sample]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -80,7 +72,7 @@ async def fetch_proxies():
     async with POOL_LOCK:
         PROXY_POOL = valid[:20]
         LAST_FETCH = datetime.now()
-    logger.info(f"Validated {len(PROXY_POOL)} working proxies: {PROXY_POOL[:3] if PROXY_POOL else 'none'}")
+    logger.info(f"Validated {len(PROXY_POOL)} proxies: {PROXY_POOL[:3]}")
 
 async def test_proxy(session: aiohttp.ClientSession, proxy_url: str) -> bool:
     try:
@@ -94,6 +86,18 @@ async def test_proxy(session: aiohttp.ClientSession, proxy_url: str) -> bool:
 async def startup():
     asyncio.create_task(fetch_proxies())
 
+# === HEALTH CHECK ===
+@app.get("/health")
+async def health():
+    await fetch_proxies()
+    async with POOL_LOCK:
+        return {
+            "status": "ok",
+            "working_proxies": len(PROXY_POOL),
+            "sample": PROXY_POOL[:3],
+            "last_fetch": LAST_FETCH.isoformat() if LAST_FETCH != datetime.min else "never"
+        }
+
 # === PROXY ENDPOINT ===
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def proxy(request: Request, full_path: str, user: str = Depends(verify_auth)):
@@ -104,7 +108,7 @@ async def proxy(request: Request, full_path: str, user: str = Depends(verify_aut
     await fetch_proxies()
     async with POOL_LOCK:
         if not PROXY_POOL:
-            raise HTTPException(503, "No working proxies. Retrying...")
+            raise HTTPException(503, "No proxies available")
 
     proxy_ip_port = random.choice(PROXY_POOL)
     proxy_url = f"http://{proxy_ip_port}"
@@ -114,9 +118,8 @@ async def proxy(request: Request, full_path: str, user: str = Depends(verify_aut
         if not parsed.scheme or not parsed.netloc:
             raise HTTPException(400, "Invalid target URL")
 
-        path = parsed.path.rstrip("/") if parsed.path else ""
-        if full_path:
-            path = f"{path}/{full_path.lstrip('/')}" if path else full_path
+        # Use full_path as the path to forward
+        path = full_path or parsed.path or "/"
         final_url = urllib.parse.urlunparse((
             parsed.scheme, parsed.netloc, path,
             parsed.params, parsed.query, parsed.fragment
@@ -139,7 +142,7 @@ async def proxy(request: Request, full_path: str, user: str = Depends(verify_aut
                     async for chunk in response.aiter_bytes():
                         yield chunk
                 except Exception as e:
-                    logger.warning(f"Stream error via {proxy_ip_port}: {e}")
+                    logger.warning(f"Stream error: {e}")
                 finally:
                     await response.aclose()
 
@@ -155,16 +158,3 @@ async def proxy(request: Request, full_path: str, user: str = Depends(verify_aut
     except Exception as e:
         logger.error(f"Error: {e}")
         raise HTTPException(500, "Server error")
-
-# === HEALTH ===
-@app.get("/health")
-async def health():
-    await fetch_proxies()
-    async with POOL_LOCK:
-        return {
-            "status": "ok",
-            "working_proxies": len(PROXY_POOL),
-            "sample": PROXY_POOL[:3],
-            "last_fetch": LAST_FETCH.isoformat() if LAST_FETCH != datetime.min else "never",
-            "sources": "GitHub raw proxy lists (unblocked)"
-        }
